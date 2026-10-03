@@ -1,98 +1,173 @@
-// import Docker from 'dockerode';
+import Docker from "dockerode";
 
-// import { TestCases } from '../types/testCases';
+import CodeExecutorStrategy, {
+    ExecutionResponse
+} from "../types/CodeExecutorStrategy";
+import { JAVA_IMAGE } from "../utils/constants";
+import createContainer from "./containerFactory";
+import decodeDockerStream from "./dockerHelper";
+import pullImage from "./pullImage";
 
-import CodeExecutorStrategy, { ExecutionResponse } from '../types/CodeExecutorStrategy';
-import { JAVA_IMAGE } from '../utils/constants';
-import createContainer from './containerFactory';
-import decodeDockerStream from './dockerHelper';
-import pullImage from './pullImage';
+function normalizeOutput(value: string = ""): string {
+    return value
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .split("\n")
+        .map((line) => line.trimEnd())
+        .join("\n")
+        .trim();
+}
+
+function escapeSingleQuotedShellValue(value: string): string {
+    return value.replace(/'/g, "'\\''");
+}
 
 class JavaExecutor implements CodeExecutorStrategy {
-    async execute(code: string, inputTestCase: string, outputCase: string): Promise<ExecutionResponse> {
-        console.log("Java executor called");
-        console.log(code, inputTestCase, outputCase);
-
+    async execute(
+        code: string,
+        inputTestCase: string,
+        outputTestCase: string
+    ): Promise<ExecutionResponse> {
         const rawLogBuffer: Buffer[] = [];
 
         await pullImage(JAVA_IMAGE);
 
-        console.log("Initialising a new java docker container");
-        console.log(`Code received is \n ${code.replace(/'/g, `'\\"`)}`)
-        const runCommand = `echo '${code.replace(/'/g, `'\\"`)}' > Main.java && javac Main.java && echo '${inputTestCase.replace(/'/g, `'\\"`)}' | java Main`;
-        console.log(runCommand);
-        const javaDockerContainer = await createContainer(JAVA_IMAGE, [
-            '/bin/sh', 
-            '-c',
-            runCommand
-        ]); 
+        const escapedCode =
+            escapeSingleQuotedShellValue(code);
 
+        const escapedInput =
+            escapeSingleQuotedShellValue(inputTestCase);
 
-        // starting / booting the corresponding docker container
-        await javaDockerContainer.start();
+        const runCommand =
+            `printf '%s' '${escapedCode}' > Main.java && ` +
+            `javac Main.java && ` +
+            `printf '%s' '${escapedInput}' | java Main`;
 
-        console.log("Started the docker container");
+        console.log(
+            "Initializing Java execution container"
+        );
 
-        const loggerStream = await javaDockerContainer.logs({
-            stdout: true,
-            stderr: true,
-            timestamps: false,
-            follow: true // whether the logs are streamed or returned as a string
-        });
-        
-        // Attach events on the stream objects to start and stop reading
-        loggerStream.on('data', (chunk) => {
-            rawLogBuffer.push(chunk);
-        });
+        const javaDockerContainer = await createContainer(
+            JAVA_IMAGE,
+            [
+                "/bin/sh",
+                "-c",
+                runCommand
+            ]
+        );
 
         try {
-            const codeResponse : string = await this.fetchDecodedStream(loggerStream, rawLogBuffer);
+            await javaDockerContainer.start();
 
-            if(codeResponse.trim() === outputCase.trim()) {
-                return {output: codeResponse, status: "SUCCESS"};
-            } else {
-                return {output: codeResponse, status: "WA"};
-            }
+            console.log(
+                "Started Java execution container"
+            );
 
+            const loggerStream =
+                await javaDockerContainer.logs({
+                    stdout: true,
+                    stderr: true,
+                    timestamps: false,
+                    follow: true
+                });
+
+            loggerStream.on(
+                "data",
+                (chunk: Buffer) => {
+                    rawLogBuffer.push(chunk);
+                }
+            );
+
+            const codeResponse =
+                await this.fetchDecodedStream(
+                    loggerStream,
+                    rawLogBuffer,
+                    javaDockerContainer
+                );
+
+            const actualOutput =
+                normalizeOutput(codeResponse);
+
+            const expectedOutput =
+                normalizeOutput(outputTestCase);
+
+            return {
+                output: codeResponse,
+                status:
+                    actualOutput === expectedOutput
+                        ? "SUCCESS"
+                        : "WA"
+            };
         } catch (error) {
-            console.log("Error occurred", error);
-            if(error === "TLE") {
-                await javaDockerContainer.kill();
-            }
-            return {output: error as string, status: "ERROR"}
+            const errorText = String(error);
+
+            console.error(
+                "Java execution failed:",
+                errorText
+            );
+
+            return {
+                output: errorText,
+                status:
+                    errorText === "TLE"
+                        ? "TLE"
+                        : "RE"
+            };
         } finally {
-
-            await javaDockerContainer.remove();
-
+            try {
+                await javaDockerContainer.remove({
+                    force: true
+                });
+            } catch (cleanupError) {
+                console.error(
+                    "Java container cleanup failed:",
+                    cleanupError
+                );
+            }
         }
     }
 
-    fetchDecodedStream(loggerStream: NodeJS.ReadableStream, rawLogBuffer: Buffer[]) : Promise<string> {
-        // TODO: May be moved to the docker helper util'
+    private fetchDecodedStream(
+        loggerStream: NodeJS.ReadableStream,
+        rawLogBuffer: Buffer[],
+        container: Docker.Container
+    ): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(async () => {
+                console.log("Java execution timeout");
 
-        return new Promise((res, rej) => {
-            const timeout = setTimeout(() => {
-                console.log("Timeout called");
-                rej("TLE");
-            }, 2000);
-            loggerStream.on('end', () => {
-                // This callback executes when the stream ends
-                clearTimeout(timeout);
-                console.log(rawLogBuffer);
-                const completeBuffer = Buffer.concat(rawLogBuffer);
-                const decodedStream = decodeDockerStream(completeBuffer);
-                // console.log(decodedStream);
-                // console.log(decodedStream.stdout);
-                if(decodedStream.stderr) {
-                    rej(decodedStream.stderr);
-                } else {
-                    res(decodedStream.stdout);
+                try {
+                    await container.kill();
+                } catch {
+                    // Container may have exited naturally.
                 }
+
+                reject("TLE");
+            }, 2000);
+
+            loggerStream.on("end", () => {
+                clearTimeout(timeout);
+
+                const completeBuffer =
+                    Buffer.concat(rawLogBuffer);
+
+                const decodedStream =
+                    decodeDockerStream(completeBuffer);
+
+                if (decodedStream.stderr.trim()) {
+                    reject(decodedStream.stderr);
+                    return;
+                }
+
+                resolve(decodedStream.stdout);
             });
-        })
+
+            loggerStream.on("error", (error) => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+        });
     }
-    
 }
-  
 
 export default JavaExecutor;

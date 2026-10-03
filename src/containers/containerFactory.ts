@@ -1,22 +1,26 @@
-import Docker from 'dockerode';
+import Docker from "dockerode";
 
-async function createContainer(imageName: string, cmdExecutable: string[]) {
+async function createContainer(
+    imageName: string,
+    cmdExecutable: string[]
+) {
     const docker = new Docker();
 
-    const container = await docker.createContainer({
+    return await docker.createContainer({
         Image: imageName,
         Cmd: cmdExecutable,
-        AttachStdin: true, // to enable input streams
-        AttachStdout: true, // to enable output streams
-        AttachStderr: true, // to enable error streams
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
         Tty: false,
+        OpenStdin: true,
         HostConfig: {
-            Memory: 1024 * 1024 * 1024, // 2GB
-        },
-        OpenStdin: true // keep the input stream open even no interaction is there
+            Memory: 256 * 1024 * 1024,
+            NanoCpus: 1_000_000_000,
+            PidsLimit: 64,
+            NetworkMode: "none"
+        }
     });
-
-    return container;
 }
 
 export default createContainer;

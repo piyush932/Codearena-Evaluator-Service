@@ -4,20 +4,75 @@ import redisConnection from "../config/redisConfig";
 import SubmissionJob from "../jobs/SubmissionJob";
 
 export default function SubmissionWorker(queueName: string) {
-    new Worker(
-        queueName, 
+    const worker = new Worker(
+        queueName,
         async (job: Job) => {
-            // console.log("SubmissionJob job worker kicking", job);
-            if(job.name === "SubmissionJob") {
-                const submissionJobInstance = new SubmissionJob(job.data);
-                console.log("Calling job handler");
-                submissionJobInstance.handle(job);
+            if (job.name !== "SubmissionJob") {
+                console.warn(
+                    `Ignoring unknown job name: ${job.name}`
+                );
 
-                return true;
+                return;
+            }
+
+            try {
+                const submissionJobInstance =
+                    new SubmissionJob(job.data);
+
+                console.log(
+                    "Calling SubmissionJob handler for job:",
+                    job.id
+                );
+
+                const result =
+                    await submissionJobInstance.handle(job);
+
+                console.log(
+                    "SubmissionJob completed:",
+                    job.id,
+                    result
+                );
+
+                return result;
+            } catch (error) {
+                console.error(
+                    "SubmissionJob failed:",
+                    job.id
+                );
+
+                console.error(error);
+
+                throw error;
             }
         },
         {
-            connection: redisConnection
+            connection: redisConnection,
+            concurrency: 1
         }
     );
+
+    worker.on("completed", (job, result) => {
+        console.log(
+            "SubmissionQueue job completed:",
+            job.id,
+            result
+        );
+    });
+
+    worker.on("failed", (job, error) => {
+        console.error(
+            "SubmissionQueue job failed:",
+            job?.id,
+            error.message
+        );
+    });
+
+    worker.on("error", (error) => {
+        console.error(
+            "SubmissionQueue worker error:",
+            error
+        );
+    });
+
+    return worker;
 }

@@ -1,17 +1,40 @@
-import Docker from 'dockerode';
+import Docker from "dockerode";
 
-export default async function pullImage(imageName: string) {
-    try {
-        const docker = new Docker();
-        return new Promise((res, rej) => {
-            docker.pull(imageName, (err: Error, stream: NodeJS.ReadableStream) => {
-                if(err) throw err;
-                docker.modem.followProgress(stream, (err, response) => err ? rej(err) : res(response), (event) => {
-                    console.log(event.status);
-                });
-            });
-        });
-    } catch (error) {
-        console.log(error);
-    }
+export default async function pullImage(
+    imageName: string
+): Promise<void> {
+    const docker = new Docker();
+
+    await new Promise<void>((resolve, reject) => {
+        docker.pull(
+            imageName,
+            (
+                pullError: Error | null,
+                stream: NodeJS.ReadableStream
+            ) => {
+                if (pullError || !stream) {
+                    reject(
+                        pullError ||
+                        new Error(
+                            `Unable to pull image: ${imageName}`
+                        )
+                    );
+
+                    return;
+                }
+
+                docker.modem.followProgress(
+                    stream,
+                    (progressError: Error | null) => {
+                        if (progressError) {
+                            reject(progressError);
+                            return;
+                        }
+
+                        resolve();
+                    }
+                );
+            }
+        );
+    });
 }

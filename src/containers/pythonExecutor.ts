@@ -1,87 +1,196 @@
-// import Docker from 'dockerode';
+import Docker from "dockerode";
 
-// import { TestCases } from '../types/testCases';
-import CodeExecutorStrategy, { ExecutionResponse } from '../types/CodeExecutorStrategy';
-import { PYTHON_IMAGE } from '../utils/constants';
-import createContainer from './containerFactory';
-import decodeDockerStream from './dockerHelper';
-import pullImage from './pullImage';
+import CodeExecutorStrategy, {
+    ExecutionResponse
+} from "../types/CodeExecutorStrategy";
+import { PYTHON_IMAGE } from "../utils/constants";
+import createContainer from "./containerFactory";
+import decodeDockerStream from "./dockerHelper";
+import pullImage from "./pullImage";
 
+function normalizeOutput(value: string = ""): string {
+    return value
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .split("\n")
+        .map((line) => line.trimEnd())
+        .join("\n")
+        .trim();
+}
+
+function escapeSingleQuotedShellValue(value: string): string {
+    return value.replace(/'/g, "'\\''");
+}
 
 class PythonExecutor implements CodeExecutorStrategy {
-
-    async execute(code: string, inputTestCase: string, outputTestCase: string): Promise<ExecutionResponse> {
-        console.log(code, inputTestCase, outputTestCase);
+    async execute(
+        code: string,
+        inputTestCase: string,
+        outputTestCase: string
+    ): Promise<ExecutionResponse> {
         const rawLogBuffer: Buffer[] = [];
 
         await pullImage(PYTHON_IMAGE);
 
+        const escapedCode =
+            escapeSingleQuotedShellValue(code);
 
-        console.log("Initialising a new python docker container");
-        const runCommand = `echo '${code.replace(/'/g, `'\\"`)}' > test.py && echo '${inputTestCase.replace(/'/g, `'\\"`)}' | python3 test.py`;
-        console.log(runCommand);
-        // const pythonDockerContainer = await createContainer(PYTHON_IMAGE, ['python3', '-c', code, 'stty -echo']); 
-        const pythonDockerContainer = await createContainer(PYTHON_IMAGE, [
-            '/bin/sh', 
-            '-c',
-            runCommand
-        ]); 
+        const escapedInput =
+            escapeSingleQuotedShellValue(inputTestCase);
 
+        const runCommand =
+            `printf '%s' '${escapedCode}' > test.py && ` +
+            `printf '%s' '${escapedInput}' | python3 test.py`;
 
-        // starting / booting the corresponding docker container
-        await pythonDockerContainer.start();
-
-        console.log("Started the docker container");
-
-        const loggerStream = await pythonDockerContainer.logs({
-            stdout: true,
-            stderr: true,
-            timestamps: false,
-            follow: true // whether the logs are streamed or returned as a string
-        });
-        
-        // Attach events on the stream objects to start and stop reading
-        loggerStream.on('data', (chunk) => {
-            rawLogBuffer.push(chunk);
-        });
+        const pythonDockerContainer =
+            await createContainer(
+                PYTHON_IMAGE,
+                [
+                    "/bin/sh",
+                    "-c",
+                    runCommand
+                ]
+            );
 
         try {
-            const codeResponse : string = await this.fetchDecodedStream(loggerStream, rawLogBuffer);
-            return {output: codeResponse, status: "COMPLETED"};
-        } catch (error) {
-            return {output: error as string, status: "ERROR"}
-        } finally {
-            await pythonDockerContainer.remove();
+            await pythonDockerContainer.start();
 
+            const loggerStream =
+                await pythonDockerContainer.logs({
+                    stdout: true,
+                    stderr: true,
+                    timestamps: false,
+                    follow: true
+                });
+
+            loggerStream.on(
+                "data",
+                (chunk: Buffer) => {
+                    rawLogBuffer.push(chunk);
+                }
+            );
+
+            const codeResponse =
+                await this.fetchDecodedStream(
+                    loggerStream,
+                    rawLogBuffer,
+                    pythonDockerContainer
+                );
+
+            const actualOutput =
+                normalizeOutput(codeResponse);
+
+            const expectedOutput =
+                normalizeOutput(outputTestCase);
+
+            return {
+                output: codeResponse,
+                status:
+                    actualOutput === expectedOutput
+                        ? "SUCCESS"
+                        : "WA"
+            };
+        } catch (error) {
+            const errorText = String(error);
+
+            console.error(
+                "Python execution error:",
+                errorText
+            );
+
+            return {
+                output: errorText,
+                status:
+                    errorText === "TLE"
+                        ? "TLE"
+                        : "RE"
+            };
+        } finally {
+            try {
+                await pythonDockerContainer.remove({
+                    force: true
+                });
+            } catch (cleanupError) {
+                console.error(
+                    "Python container cleanup failed:",
+                    cleanupError
+                );
+            }
         }
     }
 
-    fetchDecodedStream(loggerStream: NodeJS.ReadableStream, rawLogBuffer: Buffer[]) : Promise<string> {
-        // TODO: cleanup repisitive fetchDecodedStream
-        // TODO: May be moved to the docker helper util'
+    private fetchDecodedStream(
+        loggerStream: NodeJS.ReadableStream,
+        rawLogBuffer: Buffer[],
+        container: Docker.Container
+    ): Promise<string> {
+        return new Promise((resolve, reject) => {
+            let settled = false;
 
-        return new Promise((res, rej) => {
-            const timeout = setTimeout(() => {
-                console.log("Timeout called");
-                rej("TLE");
-            }, 2000);
-            loggerStream.on('end', () => {
-                // This callback executes when the stream ends
-                clearTimeout(timeout);
-                console.log(rawLogBuffer);
-                const completeBuffer = Buffer.concat(rawLogBuffer);
-                const decodedStream = decodeDockerStream(completeBuffer);
-                // console.log(decodedStream);
-                // console.log(decodedStream.stdout);
-                if(decodedStream.stderr) {
-                    rej(decodedStream.stderr);
-                } else {
-                    res(decodedStream.stdout);
+            const timeout = setTimeout(async () => {
+                if (settled) {
+                    return;
                 }
+
+                settled = true;
+
+                console.log("Python execution timed out");
+
+                try {
+                    await container.kill();
+                } catch {
+                    // The process may have already exited.
+                }
+
+                reject("TLE");
+            }, 2000);
+
+            const finishWithError = async (
+                error: unknown
+            ) => {
+                if (settled) {
+                    return;
+                }
+
+                settled = true;
+                clearTimeout(timeout);
+
+                try {
+                    await container.kill();
+                } catch {
+                    // Container may already be stopped.
+                }
+
+                reject(error);
+            };
+
+            loggerStream.on("end", () => {
+                if (settled) {
+                    return;
+                }
+
+                settled = true;
+                clearTimeout(timeout);
+
+                const completeBuffer =
+                    Buffer.concat(rawLogBuffer);
+
+                const decodedStream =
+                    decodeDockerStream(completeBuffer);
+
+                if (decodedStream.stderr.trim()) {
+                    reject(decodedStream.stderr);
+                    return;
+                }
+
+                resolve(decodedStream.stdout);
             });
-        })
+
+            loggerStream.on("error", (error) => {
+                void finishWithError(error);
+            });
+        });
     }
-    
 }
 
 export default PythonExecutor;
