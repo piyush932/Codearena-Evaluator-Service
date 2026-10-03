@@ -11,5 +11,8 @@ export interface EvaluationPayload {
     actualOutput: string;
     expectedOutput: string;
     language: string;
+    passedTestCases: number;
+    totalTestCases: number;
+    failedTestCaseIndex: number | null;
     error?: string;
 }

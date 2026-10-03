@@ -53,9 +53,6 @@ export default class SubmissionJob implements IJob {
             throw new Error("BullMQ job was not provided");
         }
 
-        console.log("Handler of the job called");
-        console.log("Submission payload:", this.payload);
-
         const payloadKeys = Object.keys(this.payload);
 
         if (payloadKeys.length !== 1) {
@@ -72,13 +69,21 @@ export default class SubmissionJob implements IJob {
         }
 
         const {
+            submissionId,
+            userId,
             code,
             language,
-            inputCase,
-            outputCase,
-            userId,
-            submissionId
+            testCases
         } = submissionPayload;
+
+        if (
+            !Array.isArray(testCases) ||
+            testCases.length === 0
+        ) {
+            throw new Error(
+                "Submission payload does not contain test cases"
+            );
+        }
 
         const strategy = createExecutor(language);
 
@@ -89,31 +94,79 @@ export default class SubmissionJob implements IJob {
         }
 
         console.log(
-            `Executing submission ${submissionId} in ${language}`
+            `Executing ${testCases.length} test cases for submission ${submissionId}`
         );
 
-        const response: ExecutionResponse =
-            await strategy.execute(
-                code,
-                inputCase,
-                outputCase
+        let passedTestCases = 0;
+        let failedTestCaseIndex: number | null = null;
+        let finalStatus: EvaluationStatus = "Success";
+
+        let actualOutput = "";
+        let expectedOutput = "";
+        let executionError: string | undefined;
+
+        for (
+            let index = 0;
+            index < testCases.length;
+            index++
+        ) {
+            const testCase = testCases[index];
+
+            console.log(
+                `Running testcase ${index + 1}/${testCases.length}`
             );
+
+            const response: ExecutionResponse =
+                await strategy.execute(
+                    code,
+                    testCase.inputCase,
+                    testCase.outputCase
+                );
+
+            actualOutput = normalizeOutput(response.output);
+            expectedOutput = normalizeOutput(
+                testCase.outputCase
+            );
+
+            if (response.status === "SUCCESS") {
+                passedTestCases++;
+
+                console.log(
+                    `Testcase ${index + 1} passed`
+                );
+
+                continue;
+            }
+
+            failedTestCaseIndex = index;
+            finalStatus = mapExecutionStatus(response.status);
+
+            if (
+                response.status === "RE" ||
+                response.status === "TLE"
+            ) {
+                executionError = response.output;
+            }
+
+            console.log(
+                `Testcase ${index + 1} failed with ${finalStatus}`
+            );
+
+            break;
+        }
 
         const evaluationPayload: EvaluationPayload = {
             submissionId: String(submissionId),
             userId,
-            status: mapExecutionStatus(response.status),
-            actualOutput: normalizeOutput(response.output),
-            expectedOutput: normalizeOutput(outputCase),
-            language
+            status: finalStatus,
+            actualOutput,
+            expectedOutput,
+            language,
+            passedTestCases,
+            totalTestCases: testCases.length,
+            failedTestCaseIndex,
+            error: executionError
         };
-
-        if (
-            response.status === "RE" ||
-            response.status === "TLE"
-        ) {
-            evaluationPayload.error = response.output;
-        }
 
         const evaluationJob = await evaluationQueue.add(
             "EvaluationJob",
